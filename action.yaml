@@ -1,53 +1,237 @@
 ---
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2025 The Linux Foundation
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
 
-# actions-template
-name: "🛠️ Actions Template"
-description: "Description of action"
-# Any relevant notes/observations can go here
+# docker-build-matrix-action
+#
+# Resolves which container images a repository builds, in what order,
+# and publishes them as a build list, a strategy.matrix and parallel
+# build stages. It builds nothing itself.
+#
+# Every default reproduces the image discovery the docker-workflows
+# lanes carried inline up to v0.6.2 (docker-workflows#29), so a lane
+# swaps its "Discover images" step for this action with no change in
+# behaviour. tests/test_equivalence.py proves that against the
+# original step body. The inputs below the "Tunables" marker are
+# opt-in extensions for monorepos.
+name: "🐳 Docker Build Matrix"
+description: >
+  Discover Dockerfiles or validate an explicit image list, order the
+  images so same-repository base images build first, and emit a build
+  list, a strategy matrix and parallel build stages.
 
 inputs:
-  input:
-    description: "Description of input"
-    required: true
+  # --- What to build ----------------------------------------------
+  path_prefix:
+    description: >
+      Project root to resolve images under, relative to the workspace.
+      Image contexts and Dockerfiles are relative to it. When not '.',
+      project-level images take its final directory as their name.
+    required: false
+    default: "."
+  images:
+    description: >
+      JSON array of the images to build. Empty (the default)
+      auto-discovers Dockerfiles instead. When set, the array must be
+      non-empty; each entry takes 'name' and 'context' (required
+      strings), 'dockerfile' (default <context>/Dockerfile) and
+      'target' (optional strings), 'build_args' (an optional list of
+      KEY=VALUE strings) and 'platforms' (an optional string or list
+      of strings, which the matrix joins with commas). Array order is
+      build order. Other keys pass through to the matrix output
+      unchanged.
+    required: false
+    default: ""
+  image_namespace:
+    description: >
+      Namespace prefixed to each image name in the matrix 'image'
+      field, for example 'onap' for onap/<name>. Each '/'-separated
+      component follows Docker's reference grammar: lowercase
+      alphanumeric runs joined by '.', '_', '__' or '-'.
+    required: false
+    default: ""
+  platforms:
+    description: >
+      Default comma-separated build platforms, copied into each matrix
+      entry lacking its own 'platforms' key. Also part of the build id.
+    required: false
+    default: ""
+  build_platform:
+    description: >
+      The builder's own platform, for BuildKit's BUILD* arguments and
+      the default target platform when order is 'dependencies'. Empty
+      uses the runner's, which is right for the local docker driver;
+      set it for a remote or cross-architecture builder.
+    required: false
+    default: ""
+  build_command:
+    description: >
+      The caller's project build command, when it produces the images
+      itself (Maven/fabric8, Gradle, jib, make). This action does not
+      run it: when set, finding no Dockerfile is not an error, because
+      the command creates the images. Also part of the build id.
+    required: false
+    default: ""
+  build_command_images:
+    description: >
+      Image references the build_command produces. Recorded in the
+      build id only; the calling workflow consumes it.
+    required: false
+    default: ""
+
+  # --- Build identity ---------------------------------------------
+  repository:
+    description: >
+      Repository being built, as owner/name. Names project-level
+      images and forms part of the build id. Defaults to the
+      repository running the workflow.
+    required: false
+    default: ""
+  ref:
+    description: >
+      The ref the calling job actually checked out, for the build id.
+      Pass the effective checkout ref (a Gerrit revision, a validated
+      release tag), not merely the workflow's ref input: the action
+      cannot infer which one the caller used.
+    required: false
+    default: ""
+  gerrit_refspec:
+    description: "Gerrit change refspec under verification, for the build id"
+    required: false
+    default: ""
+
+  # --- Tunables (opt-in; defaults preserve the lanes' behaviour) ---
+  search_depth:
+    description: >
+      Directory levels below path_prefix searched for per-image
+      Dockerfiles, from 1 to 32. The default, 1, finds
+      <dir>/Dockerfile; 2 also finds <group>/<dir>/Dockerfile.
+      Hidden directories are always skipped.
+    required: false
+    default: "1"
+  name_from:
+    description: >
+      How discovered per-image directories become image names:
+      'directory' uses the final directory name (the first image to
+      claim a name wins), 'path' joins the relative path with '-'
+      (services/api becomes services-api) and fails if two
+      directories still map to one name, rather than skip one.
+    required: false
+    default: "directory"
+  exclude_paths:
+    description: >
+      Comma- or newline-separated globs of directories, relative to
+      path_prefix, that discovery skips along with everything below
+      them, for example 'tests/*' or 'vendor'. A glob also matches
+      when it names any parent directory, so 'src' drops
+      src/main/docker. '*' also matches '/'.
+    required: false
+    default: ""
+  order:
+    description: >
+      'declared' builds in discovery or input order. 'dependencies'
+      reads the FROM, COPY --from and RUN --mount references in the
+      stages each build reaches (from its target, else the final stage),
+      resolving global ARG defaults and the entry's build_args, and
+      moves same-repository base images ahead of the images built from
+      them, otherwise keeping the declared order. A cycle fails.
+    required: false
+    default: "declared"
+  select:
+    description: >
+      Comma- or space-separated name globs choosing a subset of the
+      images, for example 'api-*'. Empty selects every image.
+    required: false
+    default: ""
+  select_dependencies:
+    description: >
+      With select, also build the same-repository images the selected
+      ones build from, so a partial build still resolves its chain.
+    required: false
+    default: "true"
+  allow_empty:
+    description: >
+      Succeed with an empty image set instead of failing when nothing
+      is found or select matches nothing. Guard downstream matrix jobs
+      on image_count, as GitHub rejects an empty matrix.
+    required: false
+    default: "false"
+  summary:
+    description: "Write the image table to the job step summary"
+    required: false
+    default: "true"
 
 outputs:
-  output:
-    description: "Description of output"
-    value: ${{ steps.code.outputs.output }}
+  images_json:
+    description: >
+      The ordered image list as compact JSON, in the input schema: the
+      contract the docker-workflows build loops consume.
+    value: ${{ steps.discover.outputs.images_json }}
+  image_count:
+    description: "Number of images to build"
+    value: ${{ steps.discover.outputs.image_count }}
+  image_names:
+    description: "Space-separated image names, in build order"
+    value: ${{ steps.discover.outputs.image_names }}
+  matrix:
+    description: >
+      {"include": [...]} for strategy.matrix via fromJSON, one entry
+      per image with normalised fields (see README).
+    value: ${{ steps.discover.outputs.matrix }}
+  build_levels:
+    description: >
+      JSON array of build stages, each an array of image names that do
+      not depend on one another. With order 'declared' each stage
+      holds one image.
+    value: ${{ steps.discover.outputs.build_levels }}
+  build_id:
+    description: >
+      Unique per invocation, for naming artifacts: a configuration
+      hash of 12 hexadecimal characters, a hyphen, and a random nonce
+      of 16 hexadecimal characters.
+    value: ${{ steps.discover.outputs.build_id }}
+  source:
+    description: "'explicit' when the images input was used, else 'discovered'"
+    value: ${{ steps.discover.outputs.source }}
 
 runs:
   using: "composite"
   steps:
-    - name: "Friendly Name"
-      id: code
+    - name: "Discover images"
+      id: discover
       shell: bash
       env:
-        INPUT_VALUE: ${{ inputs.input }}
+        INPUT_PATH_PREFIX: ${{ inputs.path_prefix }}
+        INPUT_IMAGES: ${{ inputs.images }}
+        INPUT_IMAGE_NAMESPACE: ${{ inputs.image_namespace }}
+        INPUT_PLATFORMS: ${{ inputs.platforms }}
+        INPUT_BUILD_PLATFORM: ${{ inputs.build_platform }}
+        INPUT_BUILD_COMMAND: ${{ inputs.build_command }}
+        INPUT_BUILD_COMMAND_IMAGES: ${{ inputs.build_command_images }}
+        INPUT_REPOSITORY: ${{ inputs.repository || github.repository }}
+        INPUT_REF: ${{ inputs.ref }}
+        INPUT_GERRIT_REFSPEC: ${{ inputs.gerrit_refspec }}
+        INPUT_SEARCH_DEPTH: ${{ inputs.search_depth }}
+        INPUT_NAME_FROM: ${{ inputs.name_from }}
+        INPUT_EXCLUDE_PATHS: ${{ inputs.exclude_paths }}
+        INPUT_ORDER: ${{ inputs.order }}
+        INPUT_SELECT: ${{ inputs.select }}
+        INPUT_SELECT_DEPENDENCIES: ${{ inputs.select_dependencies }}
+        INPUT_ALLOW_EMPTY: ${{ inputs.allow_empty }}
+        INPUT_SUMMARY: ${{ inputs.summary }}
       run: |
-        # Friendly Name
-        input="$INPUT_VALUE"
-        if [ -z "$input" ]; then
-          echo "Error: mandatory input was not set/configured ❌"
+        # Discover images
+        # Standard library only, so no setup-python step or package
+        # install: GitHub-hosted runners ship a suitable python3.
+        #
+        # -I (isolated mode) keeps the working directory, which holds
+        # the checked-out repository, and PYTHON* variables off
+        # sys.path. Under 'python3 -m', a repository carrying its own
+        # scripts/discover.py would run in place of this action; see
+        # entrypoint.py.
+        if ! python3 -I -c 'import sys; sys.exit(sys.version_info < (3, 10))' \
+          > /dev/null 2>&1; then
+          echo "::error::python3 3.10 or later is required on the runner"
           exit 1
         fi
-
-        # Write the output using the multiline heredoc format with a random
-        # delimiter so that an input containing newlines cannot inject
-        # additional keys into $GITHUB_OUTPUT (output-file injection). The
-        # delimiter is built from shell-builtin randomness (no external
-        # tools such as openssl/uuidgen, which are not guaranteed on
-        # self-hosted runners) and regenerated until it is provably absent
-        # from the value being emitted.
-        delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
-        while [[ "$input" == *"$delimiter"* ]]; do
-          delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
-        done
-        {
-          printf '%s<<%s\n' 'output' "$delimiter"
-          printf '%s\n' "$input"
-          printf '%s\n' "$delimiter"
-        } >> "$GITHUB_OUTPUT"
-        echo "Action received: $input ✅"
-        echo "Action received: $input ✅" >> "$GITHUB_STEP_SUMMARY"
+        python3 -I "${GITHUB_ACTION_PATH}/entrypoint.py"

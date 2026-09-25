@@ -1,6 +1,6 @@
 ---
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2025 The Linux Foundation
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
 
 # Action test/validation workflow
 name: "Test GitHub Action 🧪"
@@ -20,13 +20,13 @@ concurrency:
 permissions: {}
 
 jobs:
-  ### Test the GitHub Action in this Repository ###
-  tests:
-    name: "Test local GitHub Action"
+  ### Offline tests, including the differential against the lanes ###
+  unit:
+    name: "Unit and equivalence tests"
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    timeout-minutes: 10 # Increase this timeout value as needed
+    timeout-minutes: 10
     steps:
       # Load the egress allow-list out-of-band from the
       # organisation's .github repository and publish it as
@@ -36,7 +36,6 @@ jobs:
         with:
           config: '@18d9c4446bea555d0783e850f6d295f844fe8f67'  # v0.1.1
 
-      # Harden the runner with the just-loaded allow-list.
       - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
         uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
@@ -46,45 +45,313 @@ jobs:
             ${{ env.CONNECTION_ALLOW_LIST }}
 
       - name: "Checkout repository"
+        # yamllint disable-line rule:line-length
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      # Perform setup prior to running test(s)
-      - name: "Testing setup step"
+      - name: "Run tests"
         shell: bash
         run: |
-          # Testing setup step
-          echo "Testing setup step"
-          echo "Testing setup step/summary output" >> "$GITHUB_STEP_SUMMARY"
+          # Run tests
+          # bash, jq and sha256sum are present on the runner, so the
+          # differential tests against the inline body run here rather
+          # than skip.
+          set -euo pipefail
+          python3 -m unittest discover -s tests -t . -v
 
-      - name: "Running local action: ${{ github.repository }}"
+  ### Single-image repository: test-docker-project ###
+  single-image:
+    name: "Single-image fixture"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@805eedb0508c07714b61887a2b87a5c4bbeff22a  # v0.12.1
+        with:
+          config: '@18d9c4446bea555d0783e850f6d295f844fe8f67'  # v0.1.1
+
+      - name: 'Harden runner (block)'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The checkout path is the directory name, so a path_prefix of
+      # it names the image after the fixture, as a lane would.
+      - name: "Checkout test-docker-project"
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: lfreleng-actions/test-docker-project
+          ref: 352f02cfee626cf4b7869212918f35f2ed65afa7  # v0.1.1
+          path: test-docker-project
+          persist-credentials: false
+
+      - name: "Discover images"
+        id: discover
         uses: $/
         with:
-          input: "test input 💬"
+          path_prefix: test-docker-project
+          repository: lfreleng-actions/test-docker-project
+          ref: 352f02cfee626cf4b7869212918f35f2ed65afa7
 
-      - name: "Validated local action: ${{ github.repository }}"
+      - name: "Validate outputs"
         shell: bash
         env:
-          REPO: ${{ github.repository }}
+          IMAGES_JSON: ${{ steps.discover.outputs.images_json }}
+          IMAGE_COUNT: ${{ steps.discover.outputs.image_count }}
+          MATRIX: ${{ steps.discover.outputs.matrix }}
+          BUILD_ID: ${{ steps.discover.outputs.build_id }}
+          SOURCE: ${{ steps.discover.outputs.source }}
         run: |
-          # Local action validation
-          echo "Validated local action: $REPO"
-          echo "Validation step summary output" >> "$GITHUB_STEP_SUMMARY"
+          # Validate outputs
+          set -euo pipefail
+          # yamllint disable-line rule:line-length
+          expected='[{"name":"test-docker-project","dockerfile":"docker/Dockerfile","context":"docker"}]'
+          [ "${IMAGES_JSON}" = "${expected}" ] ||
+            { echo "::error::images_json: ${IMAGES_JSON}"; exit 1; }
+          [ "${IMAGE_COUNT}" = "1" ] && [ "${SOURCE}" = "discovered" ]
+          [[ "${BUILD_ID}" =~ ^[0-9a-f]{12}-[0-9a-f]{16}$ ]] ||
+            { echo "::error::build_id: ${BUILD_ID}"; exit 1; }
+          jq -e '.include[0].context_path == "test-docker-project/docker"
+            and .include[0].dockerfile_path ==
+              "test-docker-project/docker/Dockerfile"' \
+            <<< "${MATRIX}" > /dev/null
+          echo "Single-image discovery validated ✅"
 
+  ### Monorepo with a same-repository FROM chain ###
+  monorepo:
+    name: "Monorepo fixture"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    outputs:
+      matrix: ${{ steps.ordered.outputs.matrix }}
+    steps:
       # yamllint disable-line rule:line-length
-      - name: "Running local action: ${{ github.repository }} [Override Failure]"
-        uses: $/
-        id: failure
-        continue-on-error: true
+      - uses: lfreleng-actions/harden-runner-block-action@805eedb0508c07714b61887a2b87a5c4bbeff22a  # v0.12.1
         with:
-          invalid_input: "Some garbage"
+          config: '@18d9c4446bea555d0783e850f6d295f844fe8f67'  # v0.1.1
 
-      # Failure testing is also important
-      - name: "Error if step above did NOT fail"
-        if: steps.failure.outcome == 'success'
+      # The build step pulls the fixture's digest-pinned alpine and
+      # busybox bases from Docker Hub, which the allow-list carries.
+      - name: 'Harden runner (block)'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Checkout test-docker-monorepo"
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: lfreleng-actions/test-docker-monorepo
+          ref: b3768edbbc1828d580c5eba8cc4b003ee8df149a  # v0.1.0
+          path: test-docker-monorepo
+          persist-credentials: false
+
+      - name: "Discover images (defaults)"
+        id: default
+        uses: $/
+        with:
+          path_prefix: test-docker-monorepo
+
+      # Declared child-first, so only dependency ordering can build it.
+      - name: "Order a reversed explicit list"
+        id: ordered
+        uses: $/
+        with:
+          path_prefix: test-docker-monorepo
+          order: dependencies
+          images: >-
+            [{"name": "util-echo", "context": "util-echo"},
+             {"name": "chain-child", "context": "chain-child"},
+             {"name": "base-alpine", "context": "base-alpine"}]
+
+      - name: "Select one image and its base"
+        id: selected
+        uses: $/
+        with:
+          path_prefix: test-docker-monorepo
+          select: chain-child
+
+      - name: "Validate outputs"
+        shell: bash
+        env:
+          DEFAULT_NAMES: ${{ steps.default.outputs.image_names }}
+          ORDERED_NAMES: ${{ steps.ordered.outputs.image_names }}
+          ORDERED_LEVELS: ${{ steps.ordered.outputs.build_levels }}
+          SELECTED_NAMES: ${{ steps.selected.outputs.image_names }}
+        run: |
+          # Validate outputs
+          set -euo pipefail
+          check() {
+            [ "$2" = "$3" ] ||
+              { echo "::error::$1: expected '$3', got '$2'"; exit 1; }
+          }
+          check "discovery order" "${DEFAULT_NAMES}" \
+            "base-alpine chain-child util-echo"
+          check "dependency order" "${ORDERED_NAMES}" \
+            "util-echo base-alpine chain-child"
+          check "build levels" "${ORDERED_LEVELS}" \
+            '[["util-echo","base-alpine"],["chain-child"]]'
+          check "selection" "${SELECTED_NAMES}" "base-alpine chain-child"
+          echo "Monorepo outputs validated ✅"
+
+      - name: "Build images in the resolved order"
+        shell: bash
+        env:
+          MATRIX: ${{ steps.ordered.outputs.matrix }}
+        run: |
+          # Build images in the resolved order
+          # chain-child builds FROM base-alpine:verify, so this passes
+          # only if the action moved the base ahead of the child.
+          set -euo pipefail
+          while IFS=$'\t' read -r name dockerfile context; do
+            echo "::group::Build ${name}:verify"
+            docker build -t "${name}:verify" -f "${dockerfile}" "${context}"
+            echo "::endgroup::"
+          done < <(jq -r '.include[] |
+            [.name, .dockerfile_path, .context_path] | @tsv' <<< "${MATRIX}")
+          output=$(docker run --rm chain-child:verify)
+          grep -q "base-alpine fixture marker" <<< "${output}"
+          grep -q "chain-child fixture marker" <<< "${output}"
+          echo "Same-repository FROM chain built in resolved order ✅"
+
+  ### The matrix output drives strategy.matrix directly ###
+  fan-out:
+    name: "Matrix leg (${{ matrix.name }})"
+    needs: monorepo
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    strategy:
+      matrix: ${{ fromJSON(needs.monorepo.outputs.matrix) }}
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@805eedb0508c07714b61887a2b87a5c4bbeff22a  # v0.12.1
+        with:
+          config: '@18d9c4446bea555d0783e850f6d295f844fe8f67'  # v0.1.1
+
+      - name: 'Harden runner (block)'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Validate matrix entry"
+        shell: bash
+        env:
+          NAME: ${{ matrix.name }}
+          IMAGE: ${{ matrix.image }}
+          CONTEXT_PATH: ${{ matrix.context_path }}
+          DOCKERFILE_PATH: ${{ matrix.dockerfile_path }}
+          LEVEL: ${{ matrix.level }}
+          DEPENDS_ON: ${{ toJSON(matrix.depends_on) }}
+        run: |
+          # Validate matrix entry
+          set -euo pipefail
+          [ "${IMAGE}" = "${NAME}" ]
+          [ "${CONTEXT_PATH}" = "test-docker-monorepo/${NAME}" ]
+          [ "${DOCKERFILE_PATH}" = "${CONTEXT_PATH}/Dockerfile" ]
+          if [ "${NAME}" = "chain-child" ]; then
+            [ "${LEVEL}" = "1" ]
+            [ "$(jq -c . <<< "${DEPENDS_ON}")" = '["base-alpine"]' ]
+          else
+            [ "${LEVEL}" = "0" ]
+          fi
+          echo "Matrix entry ${NAME} validated ✅"
+
+  ### Failure modes ###
+  failures:
+    name: "Failure modes"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@805eedb0508c07714b61887a2b87a5c4bbeff22a  # v0.12.1
+        with:
+          config: '@18d9c4446bea555d0783e850f6d295f844fe8f67'  # v0.1.1
+
+      - name: 'Harden runner (block)'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Create a project with no Dockerfiles"
         shell: bash
         run: |
-          # Error if step above did NOT fail
-          echo "Error: previous test step did NOT fail ❌"
-          exit 1
+          # Create a project with no Dockerfiles
+          mkdir -p empty-project && touch empty-project/README.md
+
+      - name: "Malformed images input [expected failure]"
+        id: malformed
+        continue-on-error: true
+        uses: $/
+        with:
+          images: '[{"name": "a"}]'
+
+      - name: "No Dockerfiles found [expected failure]"
+        id: empty
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: empty-project
+
+      - name: "No Dockerfiles, allow_empty"
+        id: allowed
+        uses: $/
+        with:
+          path_prefix: empty-project
+          allow_empty: 'true'
+
+      - name: "Validate outcomes"
+        shell: bash
+        env:
+          MALFORMED: ${{ steps.malformed.outcome }}
+          EMPTY: ${{ steps.empty.outcome }}
+          ALLOWED_COUNT: ${{ steps.allowed.outputs.image_count }}
+        run: |
+          # Validate outcomes
+          set -euo pipefail
+          [ "${MALFORMED}" = "failure" ] ||
+            { echo "::error::malformed images input did not fail"; exit 1; }
+          [ "${EMPTY}" = "failure" ] ||
+            { echo "::error::empty discovery did not fail"; exit 1; }
+          [ "${ALLOWED_COUNT}" = "0" ] ||
+            { echo "::error::allow_empty count: ${ALLOWED_COUNT}"; exit 1; }
+          echo "Failure modes validated ✅"
